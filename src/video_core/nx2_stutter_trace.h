@@ -151,6 +151,12 @@ struct Totals {
     std::atomic<u64> jit_invalidated{};
     std::atomic<u64> jit_invalidated_bytes{};
     std::atomic<u64> jit_fastmem_recompiles{};
+    /// Diagnostics for the per-frame time split (EDEN_NX2_STUTTER_ALL_FRAMES): time the cores spent inside the
+    /// JIT's Run (guest code and everything the JIT does), and the JIT's own shares of it.
+    std::atomic<u64> jit_run_ns{};
+    std::atomic<u64> jit_lock_wait_ns{};
+    std::atomic<u64> jit_fault_ns{};
+    std::atomic<u64> jit_faults{};
     /// Each core's code cache in use, as last reported.
     std::array<std::atomic<u64>, 8> jit_code_bytes{};
 };
@@ -303,6 +309,10 @@ struct JitDelta {
     u64 invalidated{};
     u64 invalidated_bytes{};
     u64 fastmem_recompiles{};
+    u64 run_ns{};        ///< Inside the JIT's Run on any core: guest code, compiling, faults, callbacks
+    u64 lock_wait_ns{};  ///< Of that, waiting for the code cache's lock to emit a block
+    u64 fault_ns{};      ///< Fastmem fault handler time (on the exception thread, while the faulting core waits)
+    u64 faults{};        ///< Fastmem faults
 };
 
 /// Called by the CPU cores with what their JIT did since their last call, and its code cache use.
@@ -314,9 +324,17 @@ inline void AddJit(size_t core, const JitDelta& delta, u64 code_bytes) {
     g_totals.jit_invalidated.fetch_add(delta.invalidated, std::memory_order_relaxed);
     g_totals.jit_invalidated_bytes.fetch_add(delta.invalidated_bytes, std::memory_order_relaxed);
     g_totals.jit_fastmem_recompiles.fetch_add(delta.fastmem_recompiles, std::memory_order_relaxed);
+    g_totals.jit_lock_wait_ns.fetch_add(delta.lock_wait_ns, std::memory_order_relaxed);
+    g_totals.jit_fault_ns.fetch_add(delta.fault_ns, std::memory_order_relaxed);
+    g_totals.jit_faults.fetch_add(delta.faults, std::memory_order_relaxed);
     if (core < g_totals.jit_code_bytes.size()) {
         g_totals.jit_code_bytes[core].store(code_bytes, std::memory_order_relaxed);
     }
+}
+
+/// Called by a CPU core with the time it just spent inside the JIT's Run.
+inline void AddJitRun(u64 run_ns) {
+    g_totals.jit_run_ns.fetch_add(run_ns, std::memory_order_relaxed);
 }
 
 /// Logs a boot phase with the time and the process memory. Reads the environment itself: the
