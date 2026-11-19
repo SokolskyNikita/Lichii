@@ -21,6 +21,7 @@
 #include <span>
 #include <vector>
 
+#include "common/p60_trace.h"
 #include "common/alignment.h"
 #include "common/common_types.h"
 #include "common/dkb_frame_trace.h"
@@ -297,7 +298,13 @@ public:
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
-            master_semaphore->Wait(tick);
+            if (P60Trace::On() && !master_semaphore->IsFree(tick)) {
+                const auto p60_start = P60Trace::Now();
+                master_semaphore->Wait(tick);
+                P60Trace::Event("gpuwait", "-", tick, P60Trace::Now() - p60_start);
+            } else {
+                master_semaphore->Wait(tick);
+            }
         }
         const auto trace_waited = trace ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};

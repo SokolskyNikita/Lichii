@@ -17,6 +17,7 @@
 
 #include <fmt/format.h>
 
+#include "common/p60_trace.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
 #include "common/logging.h"
@@ -197,6 +198,9 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     }
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
+    if (P60Trace::On()) {
+        P60Trace::Event("flush", location.file_name(), location.line(), signal_value);
+    }
     AllocateNewContext();
     submitted_serial = record_serial;
     last_flush = std::chrono::steady_clock::now();
@@ -281,6 +285,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     const bool profile = VideoCommon::Nx2Profile::Enabled();
     const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
     SubmitExecution(signal_semaphore, wait_semaphore);
+    if (P60Trace::On()) {
+        P60Trace::Event("finish", location.file_name(), location.line(), presubmit_tick);
+    }
     Wait(presubmit_tick);
     AllocateNewContext();
     submitted_serial = record_serial;

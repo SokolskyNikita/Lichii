@@ -1392,6 +1392,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     constexpr u64 fog_fragment = 0x3ddfb1d7a854c849ULL;
     if (hashes[5] == fog_fragment && oot_live_dlss && OcarinaTemporalEnabled() &&
         oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
+        !VideoCommon::OcarinaBilinearBypass() &&
         oot_camera_sample_frame == render_trace_frame && !frame_dump.Capturing()) {
         const auto scene_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
         if (scene_id) {
@@ -2737,7 +2738,11 @@ bool RasterizerVulkan::Nx2ListSlotsSupported() const {
     // A direct dispatch skips a grid over the device's limits; an indirect one must not get one.
     // The slot's height and depth are 16 bits, and a width over 31 bits is no culling result.
     const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
-    const bool fits = max_dim[0] >= 0x7fffffffU && max_dim[1] >= 0xffffU && max_dim[2] >= 0xffffU;
+    // path-60 experiment (P60_LIST_INDIRECT=1): MoltenVK reports 2^30 for a limit Metal does not have.
+    // Adopted 2026-11-16: on by default, P60_LIST_INDIRECT=0 turns it off.
+    static const bool p60_relaxed = [] { const char* v = std::getenv("P60_LIST_INDIRECT"); return !v || v[0] != '0'; }();
+    const bool fits = max_dim[0] >= (p60_relaxed ? 0x40000000U : 0x7fffffffU) && max_dim[1] >= 0xffffU &&
+                      max_dim[2] >= 0xffffU;
     if (static std::atomic<bool> logged{}; !fits && !logged.exchange(true)) {
         LOG_WARNING(Render_Vulkan,
                     "Nx2 list indirect off: the device dispatches at most {}x{}x{} groups",
@@ -3490,6 +3495,7 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
     // #678 found, some with depth writes on: with the test off nothing writes depth) stay put.
     const auto& regs = maxwell3d->regs;
     if (oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr && oot_motion.extent.width != 0 &&
+        !VideoCommon::OcarinaBilinearBypass() &&
         oot_dlss_frame && *oot_dlss_frame + 1 >= render_trace_frame && regs.depth_test_enable) {
         const auto& targets = texture_cache.GetRenderTargets();
         if (targets.depth_buffer_id) {
@@ -3740,7 +3746,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, u64 na
     }
     // Without Link's pose the mesh stays empty and the motion comes from the camera alone.
     OcarinaActorMesh mesh{};
-    ReadOcarinaActor(mesh);
+    if (!VideoCommon::OcarinaBilinearBypass()) { // path-60: the bilinear scale needs no motion
+        ReadOcarinaActor(mesh);
+    }
     try {
         const auto target_view =
             target.StorageView(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless, false);

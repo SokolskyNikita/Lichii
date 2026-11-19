@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <optional>
 #include <span>
@@ -221,6 +222,30 @@ std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Pro
     return scratch_offset / 4U;
 }
 
+// path-60 experiment (P60_HMMA_MEM=1): the software HMMA moves a warp's fragments through workgroup memory
+// instead of subgroup shuffles: each lane stores its A words (a uvec4) and B words (a uvec2), and after a
+// subgroup barrier reads the 4 lanes of its A row block and the 8 lanes of its B column block.
+// Returns the number of 32-lane subgroups in a workgroup.
+std::optional<u32> ReserveSoftwareHmmaScratch(const Profile& profile, IR::Program& program) {
+    // Adopted 2026-11-16: on by default, P60_HMMA_MEM=0 turns it off.
+    static const bool enabled = [] { const char* v = std::getenv("P60_HMMA_MEM"); return !v || v[0] != '0'; }();
+    if (!enabled || !SupportsCooperativeHmma(program)) {
+        return std::nullopt;
+    }
+    bool has_hmma{};
+    for (const auto* block : program.blocks) {
+        for (const auto& inst : block->Instructions()) {
+            has_hmma |= inst.GetOpcode() == IR::Opcode::TensorMulAdd && inst.Flags<u32>() != 0;
+        }
+    }
+    const u32 invocations = program.workgroup_size[0] * program.workgroup_size[1] *
+                            program.workgroup_size[2];
+    if (!has_hmma || invocations % GUEST_WARP_LANES != 0) {
+        return std::nullopt;
+    }
+    return invocations / GUEST_WARP_LANES;
+}
+
 namespace {
 // Whether the entry point can request fp16 round-to-nearest-even and denorm preserve, so that an
 // fp32 -> fp16 -> fp32 conversion rounds like the software rounding below. The two agree for
@@ -254,6 +279,22 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
     if (UsesCooperativeHmma(ctx.profile, program)) {
         ctx.cooperative_hmma =
             DefineCooperativeHmmaTypes(ctx, ctx.U32[1], 8, ctx.profile.supported_spirv);
+    }
+    const bool through_memory = ctx.tensor_mem_word.has_value();
+    if (through_memory) {
+        const Id input_u32 = ctx.TypePointer(spv::StorageClass::Input, ctx.U32[1]);
+        ctx.tensor_subgroup_id = ctx.AddGlobalVariable(input_u32, spv::StorageClass::Input);
+        ctx.Decorate(ctx.tensor_subgroup_id, spv::Decoration::BuiltIn, spv::BuiltIn::SubgroupId);
+        ctx.interfaces.push_back(ctx.tensor_subgroup_id);
+        const Id lanes = ctx.Const(*ctx.tensor_mem_word * GUEST_WARP_LANES);
+        const auto scratch = [&](Id element) {
+            const Id pointer = ctx.TypePointer(spv::StorageClass::Workgroup, ctx.TypeArray(element, lanes));
+            const Id variable = ctx.AddGlobalVariable(pointer, spv::StorageClass::Workgroup);
+            ctx.interfaces.push_back(variable);
+            return variable;
+        };
+        ctx.tensor_mem_a = scratch(ctx.U32[4]);
+        ctx.tensor_mem_b = scratch(ctx.U32[2]);
     }
     std::array<bool, 2> needed{};
     for (const auto* block : program.blocks) {
@@ -341,17 +382,39 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         const Id col_base = ctx.OpShiftLeftLogical(u32ty, and_(lane, 3), imm(3));
         const Id a_base = add(warp_base, row_base);
         const Id b_base = add(warp_base, col_base);
+        // Through memory: the A words of the 4 lanes of this lane's row block, read once.
+        std::array<Id, 4> stored_a{};
+        Id stored_b_pointer{}, warp_first{};
+        if (through_memory) {
+            const Id ptr_a = ctx.TypePointer(spv::StorageClass::Workgroup, ctx.U32[4]);
+            stored_b_pointer = ctx.TypePointer(spv::StorageClass::Workgroup, ctx.U32[2]);
+            warp_first = ctx.OpIMul(u32ty, ctx.OpLoad(u32ty, ctx.tensor_subgroup_id), imm(GUEST_WARP_LANES));
+            const Id mine = add(warp_first, and_(lane, 31));
+            ctx.OpStore(ctx.OpAccessChain(ptr_a, ctx.tensor_mem_a, mine), matrix_a);
+            ctx.OpStore(ctx.OpAccessChain(stored_b_pointer, ctx.tensor_mem_b, mine), matrix_b);
+            SubgroupBarrier(ctx);
+            for (u32 component = 0; component < 4; ++component) {
+                stored_a[component] = ctx.OpLoad(ctx.U32[4], ctx.OpAccessChain(
+                    ptr_a, ctx.tensor_mem_a, add(warp_first, add(row_base, imm(component)))));
+            }
+        }
         // Unrolling a K=8 group lets its shuffles overlap, which latency-bound small dispatches
         // need; unrolling all of K=16 raises register pressure and slows large dispatches.
-        const auto emit_group = [&](auto pick) {
+        const auto emit_group = [&](auto pick, u32 static_group) {
             for (u32 component = 0; component < 4; ++component) {
-                const Id b = pick(inputs[4], inputs[5]);
+                const Id b = through_memory ? Id{} : pick(inputs[4], inputs[5]);
                 std::array<Id, 2> bs;
                 for (u32 col = 0; col < 2; ++col)
-                    bs[col] = unpack(ctx.OpGroupNonUniformShuffle(
+                    bs[col] = unpack(through_memory
+                        ? ctx.OpCompositeExtract(u32ty, ctx.OpLoad(ctx.U32[2], ctx.OpAccessChain(
+                              stored_b_pointer, ctx.tensor_mem_b,
+                              add(warp_first, add(col_base, imm(component + col * 4))))), static_group)
+                        : ctx.OpGroupNonUniformShuffle(
                         u32ty, imm(3), b, add(b_base, imm(component + col * 4))));
                 for (u32 row = 0; row < 2; ++row) {
-                    const Id as = unpack(ctx.OpGroupNonUniformShuffle(
+                    const Id as = unpack(through_memory
+                        ? ctx.OpCompositeExtract(u32ty, stored_a[component], row + 2 * static_group)
+                        : ctx.OpGroupNonUniformShuffle(
                         u32ty, imm(3), pick(inputs[row], inputs[row + 2]),
                         add(a_base, imm(component))));
                     for (u32 col = 0; col < 2; ++col) {
@@ -370,7 +433,11 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
                 ctx.OpStore(accumulator, round_half(ctx.OpLoad(f32ty, accumulator)));
         };
         if (variant == 0) {
-            emit_group([](Id low, Id) { return low; });
+            emit_group([](Id low, Id) { return low; }, 0);
+        } else if (through_memory) {
+            // No shuffles to overlap: both K=8 groups in line.
+            emit_group([](Id low, Id) { return low; }, 0);
+            emit_group([](Id, Id high) { return high; }, 1);
         } else {
             const Id header = ctx.OpLabel(), body = ctx.OpLabel(), next = ctx.OpLabel(),
                      end = ctx.OpLabel();
@@ -382,12 +449,16 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
             ctx.OpBranchConditional(more, body, end);
             ctx.AddLabel(body);
             const Id upper = ctx.OpIEqual(ctx.U1, group, imm(1));
-            emit_group([&](Id low, Id high) { return ctx.OpSelect(u32ty, upper, high, low); });
+            emit_group([&](Id low, Id high) { return ctx.OpSelect(u32ty, upper, high, low); }, 0);
             ctx.OpBranch(next);
             ctx.AddLabel(next);
             ctx.OpStore(counter, add(group, imm(1)));
             ctx.OpBranch(header);
             ctx.AddLabel(end);
+        }
+        if (through_memory) {
+            // The next multiply's stores must not overtake a lane still reading.
+            SubgroupBarrier(ctx);
         }
         std::array<Id, 2> packed;
         for (u32 row = 0; row < 2; ++row)

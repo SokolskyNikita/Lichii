@@ -4,6 +4,7 @@
 #include <cstring>
 #include <utility>
 
+#include "common/p60_trace.h"
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/nx2_list_slots.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -246,6 +247,13 @@ void Nx2ListSlots::RecordCopies(VkBuffer src, VkBuffer dst, std::span<const VkBu
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
+    if (P60Trace::On()) {
+        unsigned long long bytes = 0;
+        for (const auto& region : regions) {
+            bytes += region.size;
+        }
+        P60Trace::Event("copy", "nx2_list_slots.cpp", 254, bytes);
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([src, dst, list = std::vector<VkBufferCopy>(regions.begin(), regions.end())](
                          vk::CommandBuffer cmdbuf) {

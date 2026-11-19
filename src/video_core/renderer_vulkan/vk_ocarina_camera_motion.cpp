@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
 #include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
+#include "video_core/ocarina_upscale.h"
 #include "video_core/host_shaders/ocarina_dlss_color_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_output_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_composite_comp_spv.h"
@@ -941,6 +942,18 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     const f32 projection_y = std::hypot(current[4], current[5], current[6]);
     if (!transform || !std::isfinite(projection_y) || projection_y < 0.01f) {
         return false;
+    }
+    if (VideoCommon::OcarinaBilinearBypass() && target) {
+        state.scheduler.RequestOutsideRenderPassOperationContext();
+        state.queue.Acquire(state.scheduler, 2);
+        state.queue.AddSampledImage(color, state.LinearSampler());
+        state.queue.AddImage(target);
+        state.output_pass.RecordOutput(state.scheduler, state.queue.UpdateData(), *this,
+                                        target_extent, frame, false);
+        state.scheduler.InvalidateState();
+        state.last_frame = frame;
+        state.last_view_projection = current;
+        return true;
     }
     state.scheduler.GetMasterSemaphore().Refresh();
     const auto slot = std::ranges::find_if(state.slots, [&](const auto& entry) {

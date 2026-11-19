@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <source_location>
+
 #include <limits>
 
 #include <boost/container/small_vector.hpp>
@@ -184,7 +187,8 @@ public:
 
     void CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                    bool can_reorder_upload = false);
+                    bool can_reorder_upload = false,
+                    std::source_location p60_caller = std::source_location::current());
 
     void PostCopyBarrier();
 
@@ -196,7 +200,11 @@ public:
     void BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count);
 
     bool WidensUint8IndicesOnHost() const {
-        return device.IsMoltenVK() && !device.IsExtIndexTypeUint8Supported();
+        // path-60 experiment (P60_UINT8_HOST=1): also when MoltenVK takes 8-bit indices, since it converts them
+        // with a compute dispatch at every draw, which splits the Metal render pass.
+        // Adopted 2026-11-16: on by default, P60_UINT8_HOST=0 turns it off.
+        static const bool p60_always = [] { const char* v = std::getenv("P60_UINT8_HOST"); return !v || v[0] != '0'; }();
+        return device.IsMoltenVK() && (p60_always || !device.IsExtIndexTypeUint8Supported());
     }
 
     void BindHostUint8IndexBuffer(std::span<const u8> indices);
