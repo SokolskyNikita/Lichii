@@ -94,6 +94,14 @@ std::atomic<u64> g_nx2_present_count{};
 static_assert(std::atomic<u64>::is_always_lock_free);
 std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
 
+std::atomic<u64> g_jit_flush_generation{};
+
+u64 RequestJitFlush(const char* why) {
+    const u64 generation = g_jit_flush_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+    LOG_INFO(Core, "JIT code cache flush requested ({}), generation {}", why, generation);
+    return generation;
+}
+
 void RecordGuestPresent() {
     const u64 present = g_nx2_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     const u64 present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -101,6 +109,18 @@ void RecordGuestPresent() {
                                .count();
     g_nx2_present_times_ns[present % g_nx2_present_times_ns.size()].store(
         present_ns, std::memory_order_relaxed);
+    // EDEN_NX2_JIT_FLUSH_ON_STALL=<ms>: a present after a gap that long ends a load or a stall.
+    static const u64 stall_ns = [] {
+        const char* value = std::getenv("EDEN_NX2_JIT_FLUSH_ON_STALL");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) * 1'000'000ULL : 0ULL;
+    }();
+    static std::atomic<u64> last_ns{0}, last_flush_ns{0};
+    const u64 previous = last_ns.exchange(present_ns, std::memory_order_relaxed);
+    if (stall_ns != 0 && previous != 0 && present_ns - previous > stall_ns &&
+        present_ns - last_flush_ns.load(std::memory_order_relaxed) > 30'000'000'000ULL) {
+        last_flush_ns.store(present_ns, std::memory_order_relaxed);
+        RequestJitFlush("present stall");
+    }
 }
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,

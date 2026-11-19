@@ -567,6 +567,11 @@ json SpeedLimit(ToolState&, const json& params) {
     return {{"previous", previous}, {"on", setting.GetValue()}};
 }
 
+json JitClear(ToolState&, const json&) {
+    // Every CPU core flushes its JIT code cache before it next runs guest code.
+    return {{"generation", Core::RequestJitFlush("debug server")}};
+}
+
 json HostTiming(ToolState& state, const json& params) {
     auto& stats = state.system.CoreTiming().host_wait_stats;
     const bool previous = stats.load();
@@ -775,6 +780,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"trace_stop", handler(TraceStop)},
         {"trace_status", handler(TraceStatus)},
         {"speed_limit", handler(SpeedLimit)},
+        {"jit_clear", handler(JitClear)},
         {"host_timing", handler(HostTiming)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
