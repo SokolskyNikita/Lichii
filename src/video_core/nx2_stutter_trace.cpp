@@ -133,6 +133,10 @@ JitDelta SnapshotJit() {
         .invalidated = g_totals.jit_invalidated.load(std::memory_order_relaxed),
         .invalidated_bytes = g_totals.jit_invalidated_bytes.load(std::memory_order_relaxed),
         .fastmem_recompiles = g_totals.jit_fastmem_recompiles.load(std::memory_order_relaxed),
+        .run_ns = g_totals.jit_run_ns.load(std::memory_order_relaxed),
+        .lock_wait_ns = g_totals.jit_lock_wait_ns.load(std::memory_order_relaxed),
+        .fault_ns = g_totals.jit_fault_ns.load(std::memory_order_relaxed),
+        .faults = g_totals.jit_faults.load(std::memory_order_relaxed),
     };
 }
 
@@ -140,7 +144,9 @@ JitDelta operator-(const JitDelta& a, const JitDelta& b) {
     return {a.compile_ns - b.compile_ns,       a.blocks - b.blocks,
             a.clears - b.clears,               a.full_clears - b.full_clears,
             a.invalidated - b.invalidated,     a.invalidated_bytes - b.invalidated_bytes,
-            a.fastmem_recompiles - b.fastmem_recompiles};
+            a.fastmem_recompiles - b.fastmem_recompiles, a.run_ns - b.run_ns,
+            a.lock_wait_ns - b.lock_wait_ns,   a.fault_ns - b.fault_ns,
+            a.faults - b.faults};
 }
 
 void operator+=(JitDelta& a, const JitDelta& b) {
@@ -151,13 +157,21 @@ void operator+=(JitDelta& a, const JitDelta& b) {
     a.invalidated += b.invalidated;
     a.invalidated_bytes += b.invalidated_bytes;
     a.fastmem_recompiles += b.fastmem_recompiles;
+    a.run_ns += b.run_ns;
+    a.lock_wait_ns += b.lock_wait_ns;
+    a.fault_ns += b.fault_ns;
+    a.faults += b.faults;
 }
 
 std::string JitText(const JitDelta& jit) {
-    return fmt::format("jit=ms:{:.1f},blocks:{},clears:{},full:{},inval:{},inval_kib:{},fastmem:{}",
+    // run: core time inside the JIT's Run, summed over the cores; lock and fault are the JIT's waits in it.
+    return fmt::format("jit=ms:{:.1f},blocks:{},clears:{},full:{},inval:{},inval_kib:{},fastmem:{},"
+                       "run:{:.1f},lock:{:.2f},fault:{:.2f},faults:{}",
                        static_cast<double>(jit.compile_ns) / 1e6, jit.blocks, jit.clears,
                        jit.full_clears, jit.invalidated, jit.invalidated_bytes / 1024,
-                       jit.fastmem_recompiles);
+                       jit.fastmem_recompiles, static_cast<double>(jit.run_ns) / 1e6,
+                       static_cast<double>(jit.lock_wait_ns) / 1e6,
+                       static_cast<double>(jit.fault_ns) / 1e6, jit.faults);
 }
 
 /// Each core's code cache in use, in MiB.
@@ -476,7 +490,9 @@ void OnPresent() {
         long_sites.swap(g_long_sites);
     }
 
-    if (interval_ms > StutterMs) {
+    // EDEN_NX2_STUTTER_ALL_FRAMES: the line for every frame, to see where an ordinary frame's time goes.
+    static const bool all_frames = std::getenv("EDEN_NX2_STUTTER_ALL_FRAMES") != nullptr;
+    if (interval_ms > StutterMs || all_frames) {
         std::string fields;
         for (size_t index = 0; index < IdleIndex; ++index) {
             fields += fmt::format(" {}={:.1f}", category_names[index], frame.category_ms[index]);

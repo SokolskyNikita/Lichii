@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
+#include "core/core.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
@@ -31,6 +33,8 @@ namespace {
 std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_counters{};
 // EDEN_NX2_STUTTER_TRACE: each core's counters already added to the stutter trace.
 std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_traced{};
+// Code invalidations of any core: each core's cached code page is stale after one.
+std::atomic<u64> g_code_invalidations{0};
 
 void TraceJit(size_t core) {
     const auto& now = g_jit_counters[core];
@@ -49,9 +53,43 @@ void TraceJit(size_t core) {
             .invalidated = now.blocks_invalidated - traced.blocks_invalidated,
             .invalidated_bytes = now.invalidated_bytes - traced.invalidated_bytes,
             .fastmem_recompiles = now.fastmem_recompiles - traced.fastmem_recompiles,
+            .run_ns = 0,  // added by RunThread for every run, also when the JIT compiled nothing
+            .lock_wait_ns = (now.emit_lock_wait_ns + now.lookup_lock_wait_ns) -
+                            (traced.emit_lock_wait_ns + traced.lookup_lock_wait_ns),
+            .fault_ns = now.fastmem_handler_ns - traced.fastmem_handler_ns,
+            .faults = now.fastmem_faults - traced.fastmem_faults,
         },
         now.code_bytes);
+    // Shared cache over 128 MiB (arm64): links that needed a veneer, or found no room for one.
+    // Also fastmem faults taken in code that was already replaced (they cost a fault each, no recompile).
+    if (now.far_link_veneers / 256 != traced.far_link_veneers / 256 ||
+        now.unlinked_far_links != traced.unlinked_far_links ||
+        now.fastmem_stale_faults / 4096 != traced.fastmem_stale_faults / 4096) {
+        LOG_INFO(Core_ARM,
+                 "JIT core {}: {} far link veneers, {} unlinked far links, {} MiB of code, {} fastmem "
+                 "recompiles, {} stale fastmem faults",
+                 core, now.far_link_veneers, now.unlinked_far_links, now.code_bytes >> 20,
+                 now.fastmem_recompiles, now.fastmem_stale_faults);
+    }
     traced = now;
+    // Diagnostics: every core's running totals, at most every two seconds, so that the totals of a load can be
+    // read off the log at the time the load ended. Times in ms.
+    static std::array<std::chrono::steady_clock::time_point, Hardware::NUM_CPU_CORES> last_totals{};
+    if (const auto time = std::chrono::steady_clock::now(); time - last_totals[core] >= std::chrono::seconds{2}) {
+        last_totals[core] = time;
+        const auto ms = [](u64 ns) { return static_cast<double>(ns) / 1e6; };
+        LOG_INFO(Core_ARM,
+                 "JIT totals core={} blocks={} compile_ms={:.0f} lookups={} lookup_hits={} lookup_wait_ms={:.1f} "
+                 "emit_wait_ms={:.1f} emit_hold_ms={:.0f} discarded={} discarded_ms={:.1f} with_company={} "
+                 "inval_requests={} inval_blocks={} fastmem_recompiles={} fastmem_stale={} fastmem_faults={} "
+                 "fault_handler_ms={:.0f} fault_wait_ms={:.1f} clears={} veneers={} code_mib={}",
+                 core, now.blocks_compiled, ms(now.compile_ns), now.block_lookups, now.lookup_hits,
+                 ms(now.lookup_lock_wait_ns), ms(now.emit_lock_wait_ns), ms(now.emit_lock_hold_ns),
+                 now.discarded_translations, ms(now.discarded_translate_ns), now.compiles_with_company,
+                 now.invalidation_requests, now.blocks_invalidated, now.fastmem_recompiles,
+                 now.fastmem_stale_faults, now.fastmem_faults, ms(now.fastmem_handler_ns),
+                 ms(now.fastmem_lock_wait_ns), now.cache_clears, now.far_link_veneers, now.code_bytes >> 20);
+    }
 }
 } // Anonymous namespace
 
@@ -91,11 +129,11 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
     auto const aligned_vaddr = vaddr & ~Core::Memory::LICHII_PAGEMASK;
-    const u32 generation = code_generation.load(std::memory_order_acquire);
-    if (last_code_addr != aligned_vaddr || cached_code_generation != generation) {
+    const u64 invalidations = g_code_invalidations.load(std::memory_order_acquire);
+    if (last_code_addr != aligned_vaddr || code_invalidations != invalidations) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
-        cached_code_generation = generation;
+        code_invalidations = invalidations;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::LICHII_PAGEMASK) / sizeof(u32)];
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
@@ -543,21 +581,57 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         // address: the CPU's return predictor predicts guest returns instead of one shared
         // indirect jump through the return stack buffer (multicore only, no cycle counter).
         config.host_call_return = !config.enable_cycle_counting;
+        // One code cache for all cores of the process: a block is compiled once, not per core
+        // (72-74% of the six caches' code was duplicated in Ocarina of Time). 1 GiB of address
+        // space, committed as used.
+        if (m_shared_code_cache && config.host_call_return && page_table &&
+            !config.check_halt_on_memory_access) {
+            config.shared_code_cache = m_shared_code_cache;
+            config.code_cache_size = std::uint32_t(1_GiB);
+        }
+    }
+#elif defined(ARCHITECTURE_arm64)
+    // One code cache for all cores of the process, as on x86-64. Off unless
+    // EDEN_NX2_SHARED_JIT_CACHE=<MiB> is set (128 to 2048) until it is measured in a game.
+    if (m_shared_code_cache && page_table && !config.check_halt_on_memory_access &&
+        Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        static const u32 shared_mib = [] {
+            const char* const value = std::getenv("EDEN_NX2_SHARED_JIT_CACHE");
+            const long mib = value ? std::strtol(value, nullptr, 10) : 0;
+            // Whole 128 MiB regions only: a size between multiples leaves a region larger than a branch's
+            // +-128 MiB reach, and a block placed past 128 MiB in it can't reach its prelude.
+            return mib >= 128 && mib <= 2048 ? u32(mib / 128 * 128) : 0;
+        }();
+        if (shared_mib != 0) {
+            config.shared_code_cache = m_shared_code_cache;
+            config.code_cache_size = shared_mib * std::uint32_t(1_MiB);
+        }
     }
 #endif
     m_jit.emplace(config);
 }
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
+    // A requested flush (Core::RequestJitFlush) is done here, on this core's own thread, before it runs on.
+    if (const u64 generation = Core::g_jit_flush_generation.load(std::memory_order_relaxed);
+        generation != m_seen_jit_flush) {
+        m_seen_jit_flush = generation;
+        ClearInstructionCache();
+    }
     m_jit->ClearExclusiveState();
     if (m_core_index >= g_jit_counters.size()) {
         return TranslateHaltReason(m_jit->Run());
     }
     if (!Kernel::Nx2ThreadStats::g_enabled) {
-        const Dynarmic::HaltReason hr = m_jit->Run();
-        if (VideoCommon::StutterTrace::Enabled()) {
-            TraceJit(m_core_index);
+        if (!VideoCommon::StutterTrace::Enabled()) {
+            return TranslateHaltReason(m_jit->Run());
         }
+        const auto run_begin = std::chrono::steady_clock::now();
+        const Dynarmic::HaltReason hr = m_jit->Run();
+        VideoCommon::StutterTrace::AddJitRun(static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - run_begin)
+                .count()));
+        TraceJit(m_core_index);
         return TranslateHaltReason(hr);
     }
     namespace Stats = Kernel::Nx2ThreadStats;
@@ -609,10 +683,11 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
     this->SetContext(m_breakpoint_context);
 }
 
-ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
+ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index, std::shared_ptr<Dynarmic::A64::SharedCodeCache> shared_code_cache)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
     , m_cb(std::in_place, *this, process)
     , m_core_index{core_index}
+    , m_shared_code_cache{std::move(shared_code_cache)}
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
     auto& page_table_impl = page_table.GetImpl();
@@ -666,7 +741,7 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->code_generation.fetch_add(1, std::memory_order_release);
+    g_code_invalidations.fetch_add(1, std::memory_order_release);
     m_jit->ClearCache();
 }
 
@@ -674,7 +749,7 @@ void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
     // into or removed from that page).
-    m_cb->code_generation.fetch_add(1, std::memory_order_release);
+    g_code_invalidations.fetch_add(1, std::memory_order_release);
     m_jit->InvalidateCacheRange(addr, size);
 }
 
