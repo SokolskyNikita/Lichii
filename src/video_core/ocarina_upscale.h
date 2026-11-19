@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <string_view>
 
 #include "common/common_types.h"
@@ -10,6 +11,13 @@
 namespace VideoCommon {
 
 enum class OcarinaUpscaleBackend { Native, Fsr, Dlss };
+
+/// path-60 experiment: with EDEN_NX2_DLSS_REPLACEMENT=fsr and P60_OOT_BILINEAR=1 the replaced upscale pass
+/// is a plain bilinear scale of the game's tonemapped image: no jitter, no history, no FSR passes.
+inline bool OcarinaBilinearBypass() {
+    static const bool enabled = std::getenv("P60_OOT_BILINEAR") != nullptr;
+    return enabled;
+}
 
 /// The game's output passes the temporal upscaler can replace.
 enum class OcarinaUpscalePass {

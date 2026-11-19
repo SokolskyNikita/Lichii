@@ -23,6 +23,7 @@
 #include <cstring>
 #include <string>
 
+#include "common/p60_trace.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -67,11 +68,17 @@ BackIdleTrace::FrontState WaitState(DrainSite site) {
 class CountedWait {
 public:
     explicit CountedWait(DrainSite site_) : site{static_cast<size_t>(site_)} {
+        if (P60Trace::On()) {
+            p60_start = P60Trace::Now();
+        }
         if (g_acquire_counting) {
             start = std::chrono::steady_clock::now();
         }
     }
     ~CountedWait() {
+        if (p60_start) {
+            P60Trace::Event("frontwait", "-", site, P60Trace::Now() - p60_start);
+        }
         if (!start) {
             return;
         }
@@ -84,6 +91,7 @@ public:
 
 private:
     size_t site;
+    unsigned long long p60_start{};
     std::optional<std::chrono::steady_clock::time_point> start;
 };
 

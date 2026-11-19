@@ -10,6 +10,7 @@
 #include <span>
 #include <vector>
 
+#include "common/p60_trace.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -617,9 +618,20 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
 
 void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                                    bool can_reorder_upload) {
+                                    bool can_reorder_upload, std::source_location p60_caller) {
     if (dst_buffer == VK_NULL_HANDLE || src_buffer == VK_NULL_HANDLE) {
         return;
+    }
+    if (P60Trace::On()) {
+        unsigned long long bytes = 0;
+        for (const auto& copy : copies) {
+            bytes += copy.size;
+        }
+        const bool stream = src_buffer == staging_pool.StreamBuf();
+        P60Trace::Event(stream && can_reorder_upload ? "copy-reordered"
+                        : stream && barrier        ? "copy-batched"
+                                                   : "copy",
+                        "buffer_cache.h", p60_caller.line(), bytes);
     }
     static constexpr VkMemoryBarrier READ_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,

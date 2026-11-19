@@ -2134,7 +2134,9 @@ private:
             // commands, then crashes, with a slow GPU). Wait for this frame too then. Not when a
             // suspended channel brought us here: this frame can't finish before the present
             // returns.
-            const bool gpu_behind = frames_ahead == 1 && m_previous_fence_id < 192 &&
+            // path-60 experiment (P60_RUN_AHEAD=1): keep running a frame ahead when the GPU is behind too.
+            static const bool p60_run_ahead = std::getenv("P60_RUN_AHEAD") != nullptr;
+            const bool gpu_behind = !p60_run_ahead && frames_ahead == 1 && m_previous_fence_id < 192 &&
                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(
                                         m_previous_fence_id, m_previous_fence_value);
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);

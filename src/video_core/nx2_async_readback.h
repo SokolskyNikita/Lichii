@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "common/p60_trace.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 
@@ -141,6 +142,9 @@ inline void CountRead(Read kind, u64 ns) {
 
 /// BufferCache::FinishReadDownloads waited ns for the host GPU.
 inline void CountHostWait(u64 ns) {
+    if (P60Trace::On()) {
+        P60Trace::Event("hostwait", t_reading ? "reader" : "gpu-side", ns);
+    }
     if (!t_reading) {
         Add(g_counters.gpu_side_waits, 1);
         Add(g_counters.gpu_side_wait_ns, ns);
