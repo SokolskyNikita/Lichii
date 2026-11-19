@@ -125,6 +125,11 @@ extern std::atomic<u64> g_nx2_present_count;
 /// tool and bug reports.
 extern std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns;
 void RecordGuestPresent();
+/// JIT code-cache flush requests: each CPU core flushes its JIT once when this generation moves on.
+/// EDEN_NX2_JIT_FLUSH_ON_STALL=<ms>: request one when the guest presents nothing for that long (a load), at most
+/// once every 30 s, so the cache drops load-time code then instead of filling up and flushing mid-play.
+extern std::atomic<u64> g_jit_flush_generation;
+u64 RequestJitFlush(const char* why);
 
 class CpuManager;
 class Debugger;
