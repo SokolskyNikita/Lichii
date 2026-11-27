@@ -1,6 +1,6 @@
 --- a/src/joystick/hidapi/SDL_hidapi_switch2.c
 +++ b/src/joystick/hidapi/SDL_hidapi_switch2.c
-@@ -109,6 +109,9 @@
+@@ -114,6 +114,9 @@
      Uint32 rumble_error;
      bool rumble_updated;
  
@@ -10,13 +10,62 @@
      Switch2_StickCalibration left_stick;
      Switch2_StickCalibration right_stick;
      Uint8 left_trigger_zero;
-@@ -1171,6 +1174,25 @@
+@@ -162,7 +165,7 @@
+     stick_data->y.min |= data[8] << 4;
+ }
  
-     if (size < 64) {
-         // We don't know how to handle this report
-+        return;
-+    }
+-static int SendBulkData(SDL_DriverSwitch2_Context *ctx, const Uint8 *data, unsigned size)
++static int SendBulkDataTimeout(SDL_DriverSwitch2_Context *ctx, const Uint8 *data, unsigned size, unsigned int timeout_ms)
+ {
+     int transferred;
+     int res = ctx->libusb->bulk_transfer(ctx->device_handle,
+@@ -170,14 +173,14 @@
+                 (Uint8 *)data,
+                 size,
+                 &transferred,
+-                1000);
++                timeout_ms);
+     if (res < 0) {
+         return res;
+     }
+     return transferred;
+ }
+ 
+-static int RecvBulkData(SDL_DriverSwitch2_Context *ctx, Uint8 *data, unsigned size)
++static int RecvBulkDataTimeout(SDL_DriverSwitch2_Context *ctx, Uint8 *data, unsigned size, unsigned int timeout_ms)
+ {
+     int transferred;
+     int total_transferred = 0;
+@@ -193,7 +196,7 @@
+                     data,
+                     current_read,
+                     &transferred,
+-                    100);
++                    timeout_ms);
+         if (res < 0) {
+             return res;
+         }
+@@ -208,6 +211,16 @@
+     return total_transferred;
+ }
+ 
++static int SendBulkData(SDL_DriverSwitch2_Context *ctx, const Uint8 *data, unsigned size)
++{
++    return SendBulkDataTimeout(ctx, data, size, 1000);
++}
 +
++static int RecvBulkData(SDL_DriverSwitch2_Context *ctx, Uint8 *data, unsigned size)
++{
++    return RecvBulkDataTimeout(ctx, data, size, 100);
++}
++
+ static void MapJoystickAxis(Uint64 timestamp, SDL_Joystick *joystick, Uint8 axis, const Switch2_AxisCalibration *calib, float value, bool invert)
+ {
+     Sint16 mapped_value;
+@@ -1231,6 +1244,26 @@
+         return;
+     }
+ 
 +    if (device->product_id == USB_PRODUCT_NINTENDO_SWITCH2_PRO && data[0] != 0x05) {
 +        /* A pad that has just been plugged in can ignore the report format set during init and keep
 +         * sending its default format (report 0x09), which HandleSwitchProState can't parse. Ask again,
@@ -29,10 +78,14 @@
 +            Uint8 reply[0x40];
 +            ctx->report_format_request_ns = timestamp;
 +            ++ctx->report_format_requests;
-+            if (SendBulkData(ctx, set_report_format, sizeof(set_report_format)) > 0) {
-+                RecvBulkData(ctx, reply, sizeof(reply));
++            // Short timeouts: this runs on the joystick update path
++            if (SendBulkDataTimeout(ctx, set_report_format, sizeof(set_report_format), 20) > 0) {
++                RecvBulkDataTimeout(ctx, reply, sizeof(reply), 20);
 +            }
 +        }
-         return;
-     }
- 
++        return;
++    }
++
+     switch (device->product_id) {
+     case USB_PRODUCT_NINTENDO_SWITCH2_GAMECUBE_CONTROLLER:
+         HandleGameCubeState(timestamp, joystick, ctx, data, size);
