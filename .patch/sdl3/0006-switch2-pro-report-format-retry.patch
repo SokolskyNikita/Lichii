@@ -62,7 +62,7 @@
  static void MapJoystickAxis(Uint64 timestamp, SDL_Joystick *joystick, Uint8 axis, const Switch2_AxisCalibration *calib, float value, bool invert)
  {
      Sint16 mapped_value;
-@@ -1231,6 +1244,26 @@
+@@ -1214,6 +1227,26 @@
          return;
      }
  
