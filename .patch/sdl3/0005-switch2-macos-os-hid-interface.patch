@@ -1,0 +1,127 @@
+--- a/src/hidapi/SDL_hidapi.c
++++ b/src/hidapi/SDL_hidapi.c
+@@ -859,10 +859,14 @@
+     Uint16 product;
+ } SDL_libusb_required[] = {
+     { USB_VENDOR_NINTENDO, USB_PRODUCT_NINTENDO_GAMECUBE_ADAPTER },
++#ifndef SDL_PLATFORM_MACOS
++    /* On macOS the OS HID driver owns the HID interface of these and libusb can't claim it, so they
++     * are opened through IOKit and the Switch 2 driver opens their bulk interface with libusb itself */
+     { USB_VENDOR_NINTENDO, USB_PRODUCT_NINTENDO_SWITCH2_GAMECUBE_CONTROLLER },
+     { USB_VENDOR_NINTENDO, USB_PRODUCT_NINTENDO_SWITCH2_JOYCON_LEFT },
+     { USB_VENDOR_NINTENDO, USB_PRODUCT_NINTENDO_SWITCH2_JOYCON_RIGHT },
+     { USB_VENDOR_NINTENDO, USB_PRODUCT_NINTENDO_SWITCH2_PRO },
++#endif
+ };
+ 
+ static bool RequiresLibUSB(Uint16 vendor, Uint16 product, bool libusb_xbox)
+--- a/src/joystick/hidapi/SDL_hidapi_switch2.c
++++ b/src/joystick/hidapi/SDL_hidapi_switch2.c
+@@ -94,6 +94,7 @@
+ 
+     SDL_LibUSBContext *libusb;
+     libusb_device_handle *device_handle;
++    libusb_context *own_usb_context; // set when the device was opened by the OS HID backend
+     bool interface_claimed;
+     Uint8 interface_number;
+     Uint8 out_endpoint;
+@@ -365,7 +366,50 @@
+     }
+     libusb->free_config_descriptor(config);
+     return false;
++}
++
++#ifdef SDL_PLATFORM_MACOS
++/* The HID interface was opened through IOKit, which leaves the vendor bulk interface free: open the
++ * device with libusb and claim only that one. Devices are matched by vendor and product only, so with
++ * two pads of one model a pad can get the other's bulk interface: both are initialized, but serial,
++ * stick calibration, player LED and sensor enable can be swapped between them. */
++static bool OpenOwnBulkInterface(SDL_DriverSwitch2_Context *ctx, SDL_HIDAPI_Device *device)
++{
++    SDL_LibUSBContext *libusb = ctx->libusb;
++    libusb_device **list;
++
++    if (libusb->init(&ctx->own_usb_context) < 0) {
++        ctx->own_usb_context = NULL;
++        return SDL_SetError("Couldn't initialize libusb");
++    }
++    ssize_t count = libusb->get_device_list(ctx->own_usb_context, &list);
++    for (ssize_t i = 0; i < count && !ctx->interface_claimed; ++i) {
++        struct libusb_device_descriptor desc;
++        libusb_device_handle *handle;
++        if (libusb->get_device_descriptor(list[i], &desc) < 0 ||
++            desc.idVendor != device->vendor_id || desc.idProduct != device->product_id ||
++            libusb->open(list[i], &handle) < 0) {
++            continue;
++        }
++        if (FindBulkEndpoints(libusb, handle, &ctx->interface_number, &ctx->out_endpoint, &ctx->in_endpoint) &&
++            libusb->claim_interface(handle, ctx->interface_number) == 0) {
++            ctx->device_handle = handle;
++            ctx->interface_claimed = true;
++        } else {
++            libusb->close(handle);
++        }
++    }
++    if (count >= 0) {
++        libusb->free_device_list(list, 1);
++    }
++    if (!ctx->interface_claimed) {
++        libusb->exit(ctx->own_usb_context);
++        ctx->own_usb_context = NULL;
++        return SDL_SetError("Couldn't claim the bulk interface of a Switch 2 controller");
++    }
++    return true;
+ }
++#endif
+ 
+ static bool HIDAPI_DriverSwitch2_InitUSB(SDL_HIDAPI_Device *device)
+ {
+@@ -377,19 +421,28 @@
+ 
+     ctx->device_handle = (libusb_device_handle *)SDL_GetPointerProperty(SDL_hid_get_properties(device->dev), SDL_PROP_HIDAPI_LIBUSB_DEVICE_HANDLE_POINTER, NULL);
+     if (!ctx->device_handle) {
++#ifdef SDL_PLATFORM_MACOS
++        if (!OpenOwnBulkInterface(ctx, device)) {
++            return false;
++        }
++#else
+         return SDL_SetError("Couldn't get libusb device handle");
++#endif
+     }
+ 
+-    if (!FindBulkEndpoints(ctx->libusb, ctx->device_handle, &ctx->interface_number, &ctx->out_endpoint, &ctx->in_endpoint)) {
+-        return SDL_SetError("Couldn't find bulk endpoints");
+-    }
++    int res;
++    if (!ctx->interface_claimed) {
++        if (!FindBulkEndpoints(ctx->libusb, ctx->device_handle, &ctx->interface_number, &ctx->out_endpoint, &ctx->in_endpoint)) {
++            return SDL_SetError("Couldn't find bulk endpoints");
++        }
+ 
+-    ctx->libusb->set_auto_detach_kernel_driver(ctx->device_handle, true);
+-    int res = ctx->libusb->claim_interface(ctx->device_handle, ctx->interface_number);
+-    if (res < 0) {
+-        return SDL_SetError("Couldn't claim interface %d: %d\n", ctx->interface_number, res);
++        ctx->libusb->set_auto_detach_kernel_driver(ctx->device_handle, true);
++        res = ctx->libusb->claim_interface(ctx->device_handle, ctx->interface_number);
++        if (res < 0) {
++            return SDL_SetError("Couldn't claim interface %d: %d\n", ctx->interface_number, res);
++        }
++        ctx->interface_claimed = true;
+     }
+-    ctx->interface_claimed = true;
+ 
+     const Uint8 *init_sequence[] = {
+         (Uint8[]) { // Unknown purpose
+@@ -1310,6 +1363,11 @@
+         if (ctx->interface_claimed) {
+             ctx->libusb->release_interface(ctx->device_handle, ctx->interface_number);
+             ctx->interface_claimed = false;
++        }
++        if (ctx->own_usb_context) {
++            ctx->libusb->close(ctx->device_handle);
++            ctx->libusb->exit(ctx->own_usb_context);
++            ctx->own_usb_context = NULL;
+         }
+         if (ctx->libusb) {
+             SDL_QuitLibUSB();
