@@ -10,7 +10,7 @@
  
      Switch2_StickCalibration left_stick;
      Switch2_StickCalibration right_stick;
-@@ -1206,6 +1209,27 @@
+@@ -1198,6 +1201,27 @@
  
      if (size < 64) {
          // We don't know how to handle this report
